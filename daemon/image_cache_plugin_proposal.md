@@ -67,3 +67,10 @@ It also pushes the responsibility for actually implementing image cache sharing 
 
 ## Conclusion
 Everyone building the same Docker image across multiple hosts needs the cache to be coherent to get acceptable build times, but there are several different use cases for how such a cache should work depending on, amongst other things, the lifetime of the machines being used. This means that image cache sharing should be implemented as a plugin, so that everybody can choose the right implementation for their setup.
+
+
+# Implementation Strategy
+- Add '--image-cache-plugin' field to CommonConfig in daemon/config.go
+- On daemon startup, init the plugins (a la NewPlugins in pkg/authorization/plugin.go)
+- Implement an interface for an ImageCachePlugin to get requests for new stuff
+- Call said interface in the builder (by looking at the daemon?)

@@ -85,6 +85,7 @@ type CommonConfig struct {
 	ExecOptions          []string            `json:"exec-opts,omitempty"`
 	GraphDriver          string              `json:"storage-driver,omitempty"`
 	GraphOptions         []string            `json:"storage-opts,omitempty"`
+	ImageCachePlugins    []string            `json:"image-cache-plugins,omitempty"`
 	Labels               []string            `json:"labels,omitempty"`
 	Mtu                  int                 `json:"mtu,omitempty"`
 	Pidfile              string              `json:"pidfile,omitempty"`
