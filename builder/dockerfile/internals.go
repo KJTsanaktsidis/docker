@@ -456,18 +456,13 @@ func (b *Builder) processImageFrom(img builder.Image) error {
 // If no image is found, it returns `(false, nil)`.
 // If there is any error, it returns `(false, err)`.
 func (b *Builder) probeCache() (bool, error) {
-	c, ok := b.docker.(builder.ImageCache)
-	if !ok || b.options.NoCache || b.cacheBusted {
+	c := b.imageCacheForBuild
+	if b.options.NoCache || b.cacheBusted {
 		return false, nil
 	}
 	cache, err := c.GetCachedImageOnBuild(b.image, b.runConfig)
 	if err != nil {
 		return false, err
-	}
-	if len(cache) == 0 {
-		logrus.Debugf("[BUILDER] Cache miss: %s", b.runConfig.Cmd)
-		b.cacheBusted = true
-		return false, nil
 	}
 
 	fmt.Fprintf(b.Stdout, " ---> Using cache\n")

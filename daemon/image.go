@@ -8,6 +8,11 @@ import (
 	"github.com/docker/docker/reference"
 	"github.com/docker/docker/runconfig"
 	containertypes "github.com/docker/engine-api/types/container"
+	"github.com/Sirupsen/logrus"
+	"time"
+	"github.com/docker/docker/layer"
+	"github.com/docker/distribution/digest"
+	"github.com/docker/notary/tuf/data"
 )
 
 // ErrImageDoesNotExist is error returned when no image can be found for a reference.
@@ -113,12 +118,201 @@ func (daemon *Daemon) GetCachedImage(imgID image.ID, config *containertypes.Conf
 	return getMatch(siblings)
 }
 
+type daemonImageCacheForBuild struct {
+	// cacheCoroutineDatas is a slice of cacheCoroutineData structs, one for each cacheFrom
+	// image we were given
+	cacheCoroutineDatas []cacheCoroutineData
+	// daemon stores a reference to the daemon that backs this cache
+	daemon 				*Daemon
+	// lastHistoryIndex stores where in image history we last looked, so we know where to
+	// resume comparing history
+	lastHistoryIndex 	int
+	// 
+}
+
+// cacheCoroutineData is a struct containing all the data the caching coroutine needs
+type cacheCoroutineData struct {
+	// cacheFromImageName stores the candidate image name for re-using layers from
+	cacheFromImageName 	string
+	// cacheFromImage is the actual image types representing this image
+	cacheFromImage 		*image.Image
+	// reqChan is a chan for telling the search coroutine what we are looking for
+	reqChan				chan nextCachedLayerRequest
+	// resChan is the chan for reading responses from the search coroutine
+	resChan				chan nextCachedLayerResponse
+}
+
+// nextCachedLayerRequest is a struct sent on a channel to tell the history search coroutine
+// what the next step of history we are looking at
+type nextCachedLayerRequest struct {
+	// prevLayerIDs are the layers on which we will run nextCmd
+	prevLayerIDs		[]layer.DiffID
+	// nextCmd is the next command we want to run on prevLayerIDs
+	nextCmd				string
+}
+// nextCachedLayerResponse is a sruct sent on a channel by the history search coroutine
+// telling us what, if anything, it found
+type nextCachedLayerResponse struct {
+	// nextLayerID is the layer ID which is the result of running nextCmd on prevImageID,
+	// or "". If "", the channel will be closed and we should not read from it again.
+	nextLayerID 		layer.DiffID
+	// The date at which this layer was created
+	createdAt 			time.Time
+	// The name of the image this layer was cached from, as specified in cacheFrom
+	cachedFrom 			string
+}
+
+
+
+func (daemon *Daemon) MakeImageCacheForBuild(cacheFrom []string) builder.ImageCacheForBuild {
+	cache := &daemonImageCacheForBuild{
+		daemon: 			daemon,
+		lastHistoryIndex:   -1,
+	}
+
+	// for each cacheFrom image, set up the channels & coroutine for scrolling forward through
+	// its history and comparing it to what's being built
+	for _, cacheFromImageName := range cacheFrom {
+		cacheFromImage, err := daemon.GetImage(cacheFromImageName)
+		if err != nil {
+			logrus.Warnf("Could not look up %s for cache resolution, skipping: %s", cacheFromImageName, err)
+			continue
+		}
+
+		logrus.Infof("I found %s for %s", cacheFromImage.ID().String(), cacheFromImageName)
+		coroutineData := cacheCoroutineData{
+			cacheFromImageName:		cacheFromImageName,
+			cacheFromImage: 		cacheFromImage,
+			reqChan: 				make(chan nextCachedLayerRequest),
+			resChan: 				make(chan nextCachedLayerResponse),
+
+		}
+
+		go cacheSearchCoroutine(coroutineData)
+	}
+
+	return cache
+}
+
+// In the history array, we have pairs of (command, resultingLayerID). What we actually want to be able
+// to compare is pairs of (sourceLayerID, command), and if we have a match, consult resultingLayerID.
+// We also don't directly have source/resultingLayerID, but rather a boolean "did create new layer" flag.
+// Define a struct to store this mapping for convenience.
+type historyWithSourceT struct {
+	// sourceLayerID is the layer on which the command was run. Empty digest if this is the first command or
+	// if nothing has actually been added to the rootfs yet.
+	sourceLayerID		layer.DiffID
+	// cmd is the command which got run on sourceLayerID
+	cmd 				string
+	// resulingLayerID is the result of running cmd on sourceLayerID (might be the same as sourceLayerID)
+	resultingLayerID	layer.DiffID
+	// createdAt is the time the history entry was created
+	createdAt			time.Time
+}
+
+func makeHistoryWithSource(image *image.Image) []historyWithSourceT {
+	// Let's make those structs now
+	historyWithSource := make([]historyWithSourceT, len(image.History))
+	layerIndex := -1
+	for i, h := range image.History {
+
+		// previous is layerIndex from previous iteration
+		if layerIndex == -1 {
+			historyWithSource[i].sourceLayerID = digest.DigestSha256EmptyTar
+		} else {
+			historyWithSource[i].sourceLayerID = image.RootFS.DiffIDs[layerIndex]
+		}
+
+		// now increment, if needed, and look at the result layer ID
+		if !h.EmptyLayer {
+			layerIndex = layerIndex + 1
+		}
+		if layerIndex == -1 {
+			historyWithSource[i].resultingLayerID = digest.DigestSha256EmptyTar
+		} else {
+			historyWithSource[i].resultingLayerID = image.RootFS.DiffIDs[layerIndex]
+		}
+
+		// Copy the other history entries over I'm interested in
+		historyWithSource[i].cmd = h.CreatedBy
+		historyWithSource[i].createdAt = h.Created
+	}
+
+	return historyWithSource
+}
+
+func cacheSearchCoroutine(data cacheCoroutineData)  {
+	// Because a layer shasum does not include a hash of the parent in it, we need to compare
+	// *all* of the previous layers we have iterated on with the layers in the image provided to
+	// us in the request. Store a slice into data.cacheFromImage.RootFS.DiffIDs to represent this.
+	var prevStepCachedLayers []layer.DiffID
+
+	historyWithSource := makeHistoryWithSource(data.cacheFromImage)
+
+	for _, h := range historyWithSource {
+		// add prev to the list of all previous layers, if its not empty
+		if h.sourceLayerID != digest.DigestSha256EmptyTar {
+			prevStepCachedLayers = data.cacheFromImage.RootFS.DiffIDs[0:len(prevStepCachedLayers)]
+		}
+
+		req, ok := <-data.reqChan
+		if !ok {
+			// break will finish the goroutine
+			break
+		}
+
+
+		// Compare with all previous layers using our set
+		var matchesLayerIDs bool
+		if len(prevStepCachedLayers) == len(req.prevLayerIDs) {
+			matchesLayerIDs = true
+			for i := 0; i <= len(prevStepCachedLayers); i++ {
+				if prevStepCachedLayers[i] != req.prevLayerIDs[i] {
+					matchesLayerIDs = false
+					break
+				}
+			}
+		} else {
+			matchesLayerIDs = false
+		}
+
+		if req.nextCmd == h.cmd && matchesLayerIDs {
+			data.resChan <- nextCachedLayerResponse{
+				nextLayerID:	h.resultingLayerID,
+				createdAt:		h.createdAt,
+				cachedFrom:		data.cacheFromImageName,
+			}
+		} else {
+			// Send a message telling our caller not to ask us again, then close
+			// the channels
+			data.resChan <- nextCachedLayerResponse{
+				nextLayerID:	"",
+			}
+		}
+	}
+}
+
 // GetCachedImageOnBuild returns a reference to a cached image whose parent equals `parent`
 // and runconfig equals `cfg`. A cache miss is expected to return an empty ID and a nil error.
-func (daemon *Daemon) GetCachedImageOnBuild(imgID string, cfg *containertypes.Config) (string, error) {
-	cache, err := daemon.GetCachedImage(image.ID(imgID), cfg)
-	if cache == nil || err != nil {
+func (cache *daemonImageCacheForBuild) GetCachedImageOnBuild(imgID string, cfg *containertypes.Config) (string, error) {
+	cachedImage, err := cache.daemon.GetCachedImage(image.ID(imgID), cfg)
+	if err != nil {
 		return "", err
 	}
-	return cache.ID().String(), nil
+	if cachedImage != nil {
+		// We found a cache hit using the old parent image method
+		return cachedImage.ID().String(), nil
+	}
+	// We didn't find a cache hit using that method. Explore cacheFrom images for matching history
+	parentImage, err := cache.daemon.GetImage(image.ID(imgID))
+	if err != nil {
+		return "", err
+	}
+
+	// Use a loop to advance potentially multiple history entries through the parent (we might have skipped
+	// some because we found a cache hit using the above method)
+	for ; cache.lastHistoryIndex < len(parentImage.History); cache.lastHistoryIndex++ {
+		
+	}
 }
+
