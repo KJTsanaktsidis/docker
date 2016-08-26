@@ -74,6 +74,8 @@ type Builder struct {
 
 	// TODO: remove once docker.Commit can receive a tag
 	id string
+
+	imageCacheForBuild	builder.ImageCacheForBuild
 }
 
 // BuildManager implements builder.Backend and is shared across all Builder objects.
@@ -119,17 +121,18 @@ func NewBuilder(clientCtx context.Context, config *types.ImageBuildOptions, back
 	}
 	ctx, cancel := context.WithCancel(clientCtx)
 	b = &Builder{
-		clientCtx:        ctx,
-		cancel:           cancel,
-		options:          config,
-		Stdout:           os.Stdout,
-		Stderr:           os.Stderr,
-		docker:           backend,
-		context:          buildContext,
-		runConfig:        new(container.Config),
-		tmpContainers:    map[string]struct{}{},
-		id:               stringid.GenerateNonCryptoID(),
-		allowedBuildArgs: make(map[string]bool),
+		clientCtx:        	ctx,
+		cancel:           	cancel,
+		options:          	config,
+		Stdout:           	os.Stdout,
+		Stderr:           	os.Stderr,
+		docker:           	backend,
+		context:          	buildContext,
+		runConfig:        	new(container.Config),
+		tmpContainers:    	map[string]struct{}{},
+		id:               	stringid.GenerateNonCryptoID(),
+		allowedBuildArgs: 	make(map[string]bool),
+		imageCacheForBuild:	backend.(builder.ImageCache).MakeImageCacheForBuild(config.CacheFrom),
 	}
 	if dockerfile != nil {
 		b.dockerfile, err = parser.Parse(dockerfile)
